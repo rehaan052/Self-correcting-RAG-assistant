@@ -204,6 +204,25 @@ curl -X POST http://127.0.0.1:8000/feedback \
 | 413 | File larger than 1 MB |
 | 502 | The LLM or pipeline failed |
 
+## Thought process
+
+The goal was an assistant that knows when it does not know. A plain "retrieve and answer" pipeline always answers, even when the retrieved text is irrelevant, which is where hallucinations come from. So the workflow adds checks: the question is analysed (and made standalone using the chat history), retrieved chunks are graded for relevance, a failed retrieval triggers a query rewrite and a retry, and only after the retries are used up does the system try web search or say "I don't know". After generation, a grounding check verifies the answer against the sources. LangGraph fits this well because the retry and routing logic is an explicit graph with conditional edges, so every path can be tested and every run produces a readable trace.
+
+## Chunking and embedding strategy
+
+- **Chunking:** heading-aware first (every chunk stays inside one topic and carries its section path), then size-based with overlap inside a section. Code blocks are kept whole where possible and re-wrapped in a fence when a large block must be split. Tiny stub chunks are merged into the next related chunk.
+- **Embedding:** `sentence-transformers/all-MiniLM-L6-v2`, run locally on CPU, so no embedding API key or cost is needed. The embedded text is the heading path plus the prose with code removed, while the stored chunk keeps the original text.
+- **Retrieval:** dense search and BM25 are fused with Reciprocal Rank Fusion, using both the standalone question and the rewritten search query.
+- Chunk size, overlap, minimum chunk size and top-k are configurable in `app/config.py`.
+
+## Assumptions
+
+- The corpus is a set of Markdown or plain-text files. The sample corpus is five FastAPI documentation pages plus a fictional company handbook (NovaCart), so that both a technical and a policy-style question can be tested.
+- The documents are in English and small enough for a local vector store (ChromaDB). There is no multi-user authentication.
+- A hosted LLM (Groq) is acceptable for generation, grading and verification, while embeddings run locally.
+- Chat sessions only need to live as long as the API process. Feedback is stored in SQLite.
+- Web search is optional and requires a Tavily key. Without a key, the assistant answers "I don't know" when the documents have nothing.
+
 ## Design decisions
 
 These came from measuring the pipeline on the sample corpus, not from guessing.
