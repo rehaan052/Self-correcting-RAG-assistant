@@ -1,12 +1,12 @@
 # Self-Correcting RAG Assistant
 
-A question-answering assistant that **checks its own work**. It retrieves chunks from your documents, grades whether they are relevant, rewrites the query and tries again when they are not, and says *"I don't know"* instead of guessing. After writing an answer it verifies that every claim is backed by the sources.
+A question-answering assistant that **checks its own work**. It retrieves chunks from your documents, grades whether they are relevant, rewrites the query and tries again when they are not, then falls back to web search, and says *"I don't know"* instead of guessing. After writing an answer it verifies that every claim is backed by the sources.
 
 **Live demo:** https://self-correcting-rag-assistant-un9jztummyeybwrlgnvm59.streamlit.app/
 
-> The demo is a public instance: uploads are disabled and each session is limited to a few questions. It may take about a minute to wake up after being idle.
+> The demo is a public instance: uploads are disabled and each session is limited to a few questions. It may take about a minute to wake up after being idle. Questions the documents cannot answer are sent to web search.
 
-Built with **LangGraph**, **FastAPI**, **ChromaDB**, **Groq** and **Streamlit**.
+Built with **LangGraph**, **FastAPI**, **ChromaDB**, **Groq**, **Tavily** and **Streamlit**.
 
 ## Screenshots
 
@@ -18,14 +18,15 @@ Built with **LangGraph**, **FastAPI**, **ChromaDB**, **Groq** and **Streamlit**.
 |---|---|
 | ![A follow-up question resolved from chat history](docs/memory.png) | ![No answer in the documents](docs/fallback.png) |
 
-**Documents page**
-
-![Ingested documents](docs/documents.png)
+| Web search fallback | Documents page |
+|---|---|
+| ![Answer from web search after the documents had nothing](docs/websearch.png) | ![Ingested documents](docs/documents.png) |
 
 ## What it does
 
 - **Ingestion:** loads `.md` / `.txt` files, splits them into heading-aware and code-aware chunks, embeds them and stores them in ChromaDB. Re-ingesting a file replaces its old chunks, so there are no duplicates.
-- **Self-correcting workflow (LangGraph):** query analysis → retrieval → relevance grading → generation. If no chunk is relevant, the query is rewritten and retrieval is repeated, up to a retry limit. After that it falls back to web search (optional) or to an honest "I don't know".
+- **Self-correcting workflow (LangGraph):** query analysis → retrieval → relevance grading → generation. If no chunk is relevant, the query is rewritten and retrieval is repeated, up to a retry limit. After that it falls back to web search, or to an honest "I don't know" when web search is off or finds nothing.
+- **Web search fallback:** when the documents do not cover a question, Tavily results are used as context and the answer is clearly marked `answered_from_web`, with the web links as sources.
 - **Hallucination check:** a grounding judge verifies the answer against the retrieved chunks. Unsupported answers are regenerated, otherwise flagged as `unverified`.
 - **Conversation memory:** follow-up questions ("Can I carry them over to next year?") are rewritten into standalone questions using the session history.
 - **REST API (FastAPI):** `POST /query`, `POST /ingest`, `GET /documents`, `POST /feedback`.
@@ -99,7 +100,7 @@ ui.py             Streamlit UI
 
 ## Setup
 
-**Requirements:** Python 3.11 and a free [Groq API key](https://console.groq.com/).
+**Requirements:** Python 3.11 and a free [Groq API key](https://console.groq.com/). A free [Tavily API key](https://tavily.com/) is optional and enables web search.
 
 ```bash
 git clone https://github.com/rehaan052/Self-correcting-RAG-assistant.git
@@ -120,7 +121,7 @@ python -m scripts.check_setup
 | `GROQ_API_KEY` | none | Required. |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Chat model. Kept in `.env` because hosted models get retired. |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Runs locally on CPU. |
-| `TAVILY_API_KEY` | empty | Enables web-search fallback. |
+| `TAVILY_API_KEY` | empty | Enables the web-search fallback. |
 | `ENABLE_WEB_SEARCH` | `true` | Needs a Tavily key to do anything. |
 | `ENABLE_HALLUCINATION_CHECK` | `true` | Turns the grounding check on or off. |
 
@@ -213,7 +214,8 @@ These came from measuring the pipeline on the sample corpus, not from guessing.
 - **Hybrid retrieval, not vectors alone.** Dense embeddings rank short or code-heavy chunks too high and miss exact terms such as function and parameter names. BM25 (with a light stemmer and stop-word list, over section title plus text) catches exact words. The two ranked lists are merged with Reciprocal Rank Fusion, which needs no score normalisation.
 - **Multi-query retrieval.** The standalone question and the search query are both searched and all rankings are fused together, which makes follow-up questions work.
 - **Idempotent ingestion.** A file's old chunks are deleted before it is stored again, and chunk ids are content hashes, so re-ingesting never creates duplicates.
-- **One grading call per query.** All candidate chunks are graded in a single structured LLM call instead of one call per chunk. This keeps latency and rate-limit usage low.
+- **One grading call per query.** All candidate chunks are graded in a single structured LLM call instead of one call per chunk. This keeps latency and rate-limit usage low. The grader also returns a one-line reason per chunk, which is shown in the trace.
+- **Web search only after the documents fail.** The assistant tries the rewrite loop first and uses the web only when retries are used up, so questions the documents can answer never leave the knowledge base. Web answers are labelled and cite their links.
 - **Fail-open judges.** If the analyzer, grader or grounding judge fails (bad JSON, rate limit), the pipeline continues with safe defaults instead of returning a 500. Only generation itself is allowed to fail the request.
 - **Structured output with a fallback.** The helper tries `json_schema` first and falls back to function calling, because model support differs.
 - **Bounded loops.** Both the query-rewrite loop and the regeneration loop are capped, so the graph always terminates.
@@ -222,13 +224,13 @@ These came from measuring the pipeline on the sample corpus, not from guessing.
 
 ## Trade-offs and limitations
 
-- **Latency and cost.** A normal question takes about 4 LLM calls (analyze, grade, generate, grounding check). A fallback path can take about 6. This is the price of self-correction. On the free Groq tier, bursts of questions can hit rate limits.
+- **Latency and cost.** A normal question takes about 4 LLM calls (analyze, grade, generate, grounding check). A fallback path can take about 6, and a web answer adds a Tavily request. This is the price of self-correction. On the free Groq tier, bursts of questions can hit rate limits.
 - **Grading depends on retrieval.** The grader can only keep what retrieval finds. If the right chunk is not in the candidates, rewriting helps, but it is not a guarantee.
+- **Web results are less controlled.** Web answers come from search snippets, so their quality depends on the sources Tavily returns. They are always labelled `answered_from_web`.
 - **Small embedding model.** `all-MiniLM-L6-v2` is light and fast on CPU, but a larger model would retrieve better on bigger collections.
 - **BM25 index is rebuilt in memory.** It is rebuilt whenever the stored chunks change, which is fine for a small corpus but would need a real search index at scale.
 - **State is in memory.** Chat sessions live in the API process and are lost on restart. The vector store and feedback persist locally (`chroma_db/`, `feedback.db`).
-- **Public demo is ephemeral.** The hosted app rebuilds its vector store on a cold start, sleeps when idle, and enforces a soft per-session question limit.
-- **Web search is optional.** It needs a Tavily key. Without one, the assistant falls back to "I don't know".
+- **Public demo is ephemeral and shared.** The hosted app rebuilds its vector store on a cold start, sleeps when idle, enforces a soft per-session question limit, and shares one free Tavily quota across all visitors. If the quota runs out, it falls back to "I don't know".
 
 ## Possible improvements
 
